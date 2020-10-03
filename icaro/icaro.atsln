@@ -7,6 +7,8 @@ Project("{54F91283-7BC4-4236-8FF9-10F437C3AD48}") = "icaro_lib", "icaro_lib\icar
 EndProject
 Project("{54F91283-7BC4-4236-8FF9-10F437C3AD48}") = "icaro_imu", "icaro_imu\icaro_imu.cproj", "{A24D3B19-BA14-4107-9041-B5356119502E}"
 EndProject
+Project("{54F91283-7BC4-4236-8FF9-10F437C3AD48}") = "icaro_main", "icaro_main\icaro_main.cproj", "{CF963061-D8B3-4A51-A237-7EBA6A167302}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|AVR = Debug|AVR
@@ -21,6 +23,10 @@ Global
 		{A24D3B19-BA14-4107-9041-B5356119502E}.Debug|AVR.Build.0 = Debug|AVR
 		{A24D3B19-BA14-4107-9041-B5356119502E}.Release|AVR.ActiveCfg = Release|AVR
 		{A24D3B19-BA14-4107-9041-B5356119502E}.Release|AVR.Build.0 = Release|AVR
+		{CF963061-D8B3-4A51-A237-7EBA6A167302}.Debug|AVR.ActiveCfg = Debug|AVR
+		{CF963061-D8B3-4A51-A237-7EBA6A167302}.Debug|AVR.Build.0 = Debug|AVR
+		{CF963061-D8B3-4A51-A237-7EBA6A167302}.Release|AVR.ActiveCfg = Release|AVR
+		{CF963061-D8B3-4A51-A237-7EBA6A167302}.Release|AVR.Build.0 = Release|AVR
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
