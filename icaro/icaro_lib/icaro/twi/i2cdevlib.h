@@ -3,6 +3,8 @@
 
 #include <inttypes.h>
 
+#define I2CDEV_DEFAULT_READ_TIMEOUT     1000
+
 int8_t i2c_read_bit(uint8_t dev_addr, uint8_t reg_addr, uint8_t bit_num, uint8_t *data, uint16_t timeout);
 int8_t i2c_read_bit_word(uint8_t dev_addr, uint8_t reg_addr, uint8_t bit_num, uint16_t *data, uint16_t timeout);
 int8_t i2c_read_bits(uint8_t dev_addr, uint8_t reg_addr, uint8_t bit_start, uint8_t length, uint8_t *data, uint16_t timeout);

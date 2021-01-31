@@ -18,4 +18,11 @@
 #define TWI_SRX   3
 #define TWI_STX   4
 
+void twi_init();
+uint8_t twi_read_from(uint8_t address, uint8_t *data, uint8_t length, uint8_t send_stop);
+uint8_t twi_write_to(uint8_t address, uint8_t *data, uint8_t length, uint8_t wait, uint8_t send_stop);
+void twi_reply(uint8_t ack);
+void twi_stop(void);
+void twi_release_bus(void);
+
 #endif

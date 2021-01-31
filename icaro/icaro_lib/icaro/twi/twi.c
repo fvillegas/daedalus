@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <avr/sfr_defs.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -194,12 +195,10 @@ uint8_t twi_write_to(uint8_t address, uint8_t *data, uint8_t length, uint8_t wai
 void twi_reply(uint8_t ack)
 {
     // transmit master read ready signal, with or without ack
-    if (ack)
-    {
+    if (ack) {
         TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT) | _BV(TWEA);
     }
-    else
-    {
+    else {
         TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT);
     }
 }

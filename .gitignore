@@ -1,3 +1,4 @@
-rpi-poc/**/*.o
-rpi-poc/main
+icaro/.vs/
+icaro/**/Debug/
 icaro/**/Release/
+**/*.o
