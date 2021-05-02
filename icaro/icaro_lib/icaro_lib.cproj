@@ -139,12 +139,6 @@
     <Compile Include="icaro\twi\twi.c">
       <SubType>compile</SubType>
     </Compile>
-    <Compile Include="icaro\twi\i2cdevlib.c">
-      <SubType>compile</SubType>
-    </Compile>
-    <Compile Include="icaro\twi\i2cdevlib.h">
-      <SubType>compile</SubType>
-    </Compile>
     <Compile Include="icaro\twi\twi.h">
       <SubType>compile</SubType>
     </Compile>

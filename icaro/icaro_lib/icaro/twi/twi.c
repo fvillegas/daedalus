@@ -1,10 +1,44 @@
-#include <stdbool.h>
-#include <avr/sfr_defs.h>
+/************************************************************************/
+/* COPY FROM ARDUINO.CC PROJECT                                         */
+/************************************************************************/
+
+/*
+  twi.c - TWI/I2C library for Wiring & Arduino
+  Copyright (c) 2006 Nicholas Zambetti.  All right reserved.
+
+  This library is free software; you can redistribute it and/or
+  modify it under the terms of the GNU Lesser General Public
+  License as published by the Free Software Foundation; either
+  version 2.1 of the License, or (at your option) any later version.
+
+  This library is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  Lesser General Public License for more details.
+
+  You should have received a copy of the GNU Lesser General Public
+  License along with this library; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+  Modified 2012 by Todd Krein (todd@krein.org) to implement repeated starts
+  Modified 2020 by Greyson Christoforo (grey@christoforo.net) to implement timeouts
+*/
+
+/*
+* Modifications
+* remove arduino dependencies
+* rename functions and variables
+*/
+
+#include <math.h>
+#include <stdlib.h>
+#include <inttypes.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <util/twi.h>
+#include <util/delay.h>
+#include <compat/twi.h>
 
-#include "twi.h"
+#include "../timer/timer.h"
 
 #ifndef cbi
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
@@ -14,10 +48,23 @@
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 #endif
 
+// #include "pins_arduino.h"
+#include "twi.h"
+
 static volatile uint8_t twi_state;
 static volatile uint8_t twi_slarw;
-static volatile uint8_t twi_send_stop;    // should the transaction end with a stop
+static volatile uint8_t twi_send_stop;   // should the transaction end with a stop
 static volatile uint8_t twi_in_rep_start; // in the middle of a repeated start
+
+// twi_timeout_us > 0 prevents the code from getting stuck in various while loops here
+// if twi_timeout_us == 0 then timeout checking is disabled (the previous Wire lib behavior)
+// at some point in the future, the default twi_timeout_us value could become 25000
+// and twi_do_reset_on_timeout could become 1
+// to conform to the SMBus standard
+// http://smbus.org/specs/SMBus_3_1_20180319.pdf
+static volatile uint32_t twi_timeout_us = 0ul;
+static volatile uint8_t twi_timed_out_flag = 0;      // a timeout has been seen
+static volatile uint8_t twi_do_reset_on_timeout = 0; // reset the TWI registers on timeout
 
 static void (*twi_on_slave_transmit)(void);
 static void (*twi_on_slave_receive)(uint8_t *, int);
@@ -26,7 +73,7 @@ static uint8_t twi_master_buffer[TWI_BUFFER_LENGTH];
 static volatile uint8_t twi_master_buffer_index;
 static volatile uint8_t twi_master_buffer_length;
 
-static uint8_t twi_tx_buffer[TWI_BUFFER_LENGTH];
+static uint8_t twi_txBuffer[TWI_BUFFER_LENGTH];
 static volatile uint8_t twi_tx_buffer_index;
 static volatile uint8_t twi_tx_buffer_length;
 
@@ -35,309 +82,656 @@ static volatile uint8_t twi_rx_buffer_index;
 
 static volatile uint8_t twi_error;
 
-void twi_init()
+/* 
+ * Function twi_init
+ * Desc     readys twi pins and sets twi bitrate
+ * Input    none
+ * Output   none
+ */
+void twi_init(void)
 {
-    // initialize twi prescaler and bit rate
-    cbi(TWSR, TWPS0);
-    cbi(TWSR, TWPS1);
-    TWBR = ((F_CPU / TWI_FREQ) - 16) / 2;
+  // initialize state
+  twi_state = TWI_READY;
+  twi_send_stop = 1; // default value
+  twi_in_rep_start = 0;
 
-    // enable twi module, acks, and twi interrupt
-    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA);
+  // activate internal pullups for twi.
+  // digitalWrite(SDA, 1);
+  // digitalWrite(SCL, 1);
+
+  // initialize twi prescaler and bit rate
+  cbi(TWSR, TWPS0);
+  cbi(TWSR, TWPS1);
+  TWBR = ((F_CPU / TWI_FREQ) - 16) / 2;
+
+  /* twi bit rate formula from atmega128 manual pg 204
+  SCL Frequency = CPU Clock Frequency / (16 + (2 * TWBR))
+  note: TWBR should be 10 or higher for master mode
+  It is 72 for a 16mhz Wiring board with 100kHz TWI */
+
+  // enable twi module, acks, and twi interrupt
+  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA);
 }
 
+/* 
+ * Function twi_disable
+ * Desc     disables twi pins
+ * Input    none
+ * Output   none
+ */
+void twi_disable(void)
+{
+  // disable twi module, acks, and twi interrupt
+  TWCR &= ~(_BV(TWEN) | _BV(TWIE) | _BV(TWEA));
+
+  // deactivate internal pullups for twi.
+  // digitalWrite(SDA, 0);
+  // digitalWrite(SCL, 0);
+}
+
+/* 
+ * Function twi_slaveInit
+ * Desc     sets slave address and enables interrupt
+ * Input    none
+ * Output   none
+ */
+void twi_set_address(uint8_t address)
+{
+  // set twi slave address (skip over TWGCE bit)
+  TWAR = address << 1;
+}
+
+/* 
+ * Function twi_set_frequency
+ * Desc     sets twi bit rate
+ * Input    Clock Frequency
+ * Output   none
+ */
+void twi_set_frequency(uint32_t frequency)
+{
+  TWBR = ((F_CPU / frequency) - 16) / 2;
+
+  /* twi bit rate formula from atmega128 manual pg 204
+  SCL Frequency = CPU Clock Frequency / (16 + (2 * TWBR))
+  note: TWBR should be 10 or higher for master mode
+  It is 72 for a 16mhz Wiring board with 100kHz TWI */
+}
+
+/* 
+ * Function twi_read_from
+ * Desc     attempts to become twi bus master and read a
+ *          series of bytes from a device on the bus
+ * Input    address: 7bit i2c device address
+ *          data: pointer to byte array
+ *          length: number of bytes to read into array
+ *          send_stop: Boolean indicating whether to send a stop at the end
+ * Output   number of bytes read
+ */
 uint8_t twi_read_from(uint8_t address, uint8_t *data, uint8_t length, uint8_t send_stop)
 {
-    uint8_t i;
-    // ensure data will fit into buffer
-    if (TWI_BUFFER_LENGTH < length)
+  uint8_t i;
+
+  // ensure data will fit into buffer
+  if (TWI_BUFFER_LENGTH < length)
+  {
+    return 0;
+  }
+
+  // wait until twi is ready, become master receiver
+  uint32_t start_micros = micros();
+  while (TWI_READY != twi_state)
+  {
+    if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
     {
+      twi_handle_timeout(twi_do_reset_on_timeout);
+      return 0;
+    }
+  }
+  twi_state = TWI_MRX;
+  twi_send_stop = send_stop;
+  // reset error state (0xFF.. no error occured)
+  twi_error = 0xFF;
+
+  // initialize buffer iteration vars
+  twi_master_buffer_index = 0;
+  twi_master_buffer_length = length - 1; // This is not intuitive, read on...
+  // On receive, the previously configured ACK/NACK setting is transmitted in
+  // response to the received byte before the interrupt is signalled.
+  // Therefor we must actually set NACK when the _next_ to last byte is
+  // received, causing that NACK to be sent in response to receiving the last
+  // expected byte of data.
+
+  // build sla+w, slave device address + w bit
+  twi_slarw = TW_READ;
+  twi_slarw |= address << 1;
+
+  if (1 == twi_in_rep_start)
+  {
+    // if we're in the repeated start state, then we've already sent the start,
+    // (@@@ we hope), and the TWI statemachine is just waiting for the address byte.
+    // We need to remove ourselves from the repeated start state before we enable interrupts,
+    // since the ISR is ASYNC, and we could get confused if we hit the ISR before cleaning
+    // up. Also, don't enable the START interrupt. There may be one pending from the
+    // repeated start that we sent ourselves, and that would really confuse things.
+    twi_in_rep_start = 0; // remember, we're dealing with an ASYNC ISR
+    start_micros = micros();
+    do
+    {
+      TWDR = twi_slarw;
+      if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
+      {
+        twi_handle_timeout(twi_do_reset_on_timeout);
         return 0;
-    }
+      }
+    } while (TWCR & _BV(TWWC));
+    TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE); // enable INTs, but not START
+  }
+  else
+  {
+    // send start condition
+    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTA);
+  }
 
-    // wait until twi is ready, become master receiver
-    while (TWI_READY != twi_state)
+  // wait for read operation to complete
+  start_micros = micros();
+  while (TWI_MRX == twi_state)
+  {
+    if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
     {
-        continue;
+      twi_handle_timeout(twi_do_reset_on_timeout);
+      return 0;
     }
+  }
 
-    twi_state = TWI_MRX;
-    twi_send_stop = send_stop;
-    // reset error state (0xFF.. no error occured)
-    twi_error = 0xFF;
+  if (twi_master_buffer_index < length)
+  {
+    length = twi_master_buffer_index;
+  }
 
-    // initialize buffer iteration vars
-    twi_master_buffer_index = 0;
-    twi_master_buffer_length = length - 1; // This is not intuitive, read on...
-    // On receive, the previously configured ACK/NACK setting is transmitted in
-    // response to the received byte before the interrupt is signalled.
-    // Therefor we must actually set NACK when the _next_ to last byte is
-    // received, causing that NACK to be sent in response to receiving the last
-    // expected byte of data.
+  // copy twi buffer to data
+  for (i = 0; i < length; ++i)
+  {
+    data[i] = twi_master_buffer[i];
+  }
 
-    // build sla+w, slave device address + w bit
-    twi_slarw = TW_READ;
-    twi_slarw |= address << 1;
-
-    if (TRUE== twi_in_rep_start)
-    {
-        // if we're in the repeated start state, then we've already sent the start,
-        // (@@@ we hope), and the TWI statemachine is just waiting for the address byte.
-        // We need to remove ourselves from the repeated start state before we enable interrupts,
-        // since the ISR is ASYNC, and we could get confused if we hit the ISR before cleaning
-        // up. Also, don't enable the START interrupt. There may be one pending from the
-        // repeated start that we sent ourselves, and that would really confuse things.
-        twi_in_rep_start = false; // remember, we're dealing with an ASYNC ISR
-        do
-        {
-            TWDR = twi_slarw;
-        } while (TWCR & _BV(TWWC));
-        TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE); // enable INTs, but not START
-    }
-    else
-    {
-        // send start condition
-        TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTA);
-    }
-    
-    // wait for read operation to complete
-    while (TWI_MRX == twi_state)
-    {
-        continue;
-    }
-
-    if (twi_master_buffer_index < length)
-        length = twi_master_buffer_index;
-
-    // copy twi buffer to data
-    for (i = 0; i < length; ++i)
-    {
-        data[i] = twi_master_buffer[i];
-    }
-
-    return length;
+  return length;
 }
 
+/* 
+ * Function twi_write_to
+ * Desc     attempts to become twi bus master and write a
+ *          series of bytes to a device on the bus
+ * Input    address: 7bit i2c device address
+ *          data: pointer to byte array
+ *          length: number of bytes in array
+ *          wait: boolean indicating to wait for write or not
+ *          send_stop: boolean indicating whether or not to send a stop at the end
+ * Output   0 .. success
+ *          1 .. length to long for buffer
+ *          2 .. address send, NACK received
+ *          3 .. data send, NACK received
+ *          4 .. other twi error (lost bus arbitration, bus error, ..)
+ *          5 .. timeout
+ */
 uint8_t twi_write_to(uint8_t address, uint8_t *data, uint8_t length, uint8_t wait, uint8_t send_stop)
 {
-    uint8_t i;
+  uint8_t i;
 
-    // ensure data will fit into buffer
-    if (TWI_BUFFER_LENGTH < length)
+  // ensure data will fit into buffer
+  if (TWI_BUFFER_LENGTH < length)
+  {
+    return 1;
+  }
+
+  // wait until twi is ready, become master transmitter
+  uint32_t start_micros = micros();
+  while (TWI_READY != twi_state)
+  {
+    if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
     {
-        return 1;
+      twi_handle_timeout(twi_do_reset_on_timeout);
+      return (5);
     }
+  }
+  twi_state = TWI_MTX;
+  twi_send_stop = send_stop;
+  // reset error state (0xFF.. no error occured)
+  twi_error = 0xFF;
 
-    // wait until twi is ready, become master transmitter
-    while (TWI_READY != twi_state)
+  // initialize buffer iteration vars
+  twi_master_buffer_index = 0;
+  twi_master_buffer_length = length;
+
+  // copy data to twi buffer
+  for (i = 0; i < length; ++i)
+  {
+    twi_master_buffer[i] = data[i];
+  }
+
+  // build sla+w, slave device address + w bit
+  twi_slarw = TW_WRITE;
+  twi_slarw |= address << 1;
+
+  // if we're in a repeated start, then we've already sent the START
+  // in the ISR. Don't do it again.
+  //
+  if (1 == twi_in_rep_start)
+  {
+    // if we're in the repeated start state, then we've already sent the start,
+    // (@@@ we hope), and the TWI statemachine is just waiting for the address byte.
+    // We need to remove ourselves from the repeated start state before we enable interrupts,
+    // since the ISR is ASYNC, and we could get confused if we hit the ISR before cleaning
+    // up. Also, don't enable the START interrupt. There may be one pending from the
+    // repeated start that we sent outselves, and that would really confuse things.
+    twi_in_rep_start = 0; // remember, we're dealing with an ASYNC ISR
+    start_micros = micros();
+    do
     {
-        continue;
-    }
-    
-    twi_state = TWI_MTX;
-    twi_send_stop = send_stop;
-    // reset error state (0xFF.. no error occured)
-    twi_error = 0xFF;
+      TWDR = twi_slarw;
+      if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
+      {
+        twi_handle_timeout(twi_do_reset_on_timeout);
+        return (5);
+      }
+    } while (TWCR & _BV(TWWC));
+    TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE); // enable INTs, but not START
+  }
+  else
+  {
+    // send start condition
+    TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE) | _BV(TWSTA); // enable INTs
+  }
 
-    // initialize buffer iteration vars
-    twi_master_buffer_index = 0;
-    twi_master_buffer_length = length;
-
-    // copy data to twi buffer
-    for (i = 0; i < length; ++i)
+  // wait for write operation to complete
+  start_micros = micros();
+  while (wait && (TWI_MTX == twi_state))
+  {
+    if ((twi_timeout_us > 0ul) && ((micros() - start_micros) > twi_timeout_us))
     {
-        twi_master_buffer[i] = data[i];
+      twi_handle_timeout(twi_do_reset_on_timeout);
+      return (5);
     }
+  }
 
-    // build sla+w, slave device address + w bit
-    twi_slarw = TW_WRITE;
-    twi_slarw |= address << 1;
-
-    // if we're in a repeated start, then we've already sent the START
-    // in the ISR. Don't do it again.
-    //
-    if (TRUE == twi_in_rep_start)
-    {
-        // if we're in the repeated start state, then we've already sent the start,
-        // (@@@ we hope), and the TWI statemachine is just waiting for the address byte.
-        // We need to remove ourselves from the repeated start state before we enable interrupts,
-        // since the ISR is ASYNC, and we could get confused if we hit the ISR before cleaning
-        // up. Also, don't enable the START interrupt. There may be one pending from the
-        // repeated start that we sent outselves, and that would really confuse things.
-        twi_in_rep_start = FALSE; // remember, we're dealing with an ASYNC ISR
-        do
-        {
-            TWDR = twi_slarw;
-        } while (TWCR & _BV(TWWC));
-        TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE); // enable INTs, but not START
-    }
-    else
-    {
-        // send start condition
-        TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE) | _BV(TWSTA); // enable INTs
-    }
-    // wait for write operation to complete
-    while (wait && (TWI_MTX == twi_state))
-    {
-        continue;
-    }
-
-    if (twi_error == 0xFF)
-        return 0; // success
-    else if (twi_error == TW_MT_SLA_NACK)
-        return 2; // error: address send, nack received
-    else if (twi_error == TW_MT_DATA_NACK)
-        return 3; // error: data send, nack received
-    else
-        return 4; // other twi error
+  if (twi_error == 0xFF)
+    return 0; // success
+  else if (twi_error == TW_MT_SLA_NACK)
+    return 2; // error: address send, nack received
+  else if (twi_error == TW_MT_DATA_NACK)
+    return 3; // error: data send, nack received
+  else
+    return 4; // other twi error
 }
 
+/* 
+ * Function twi_transmit
+ * Desc     fills slave tx buffer with data
+ *          must be called in slave tx event callback
+ * Input    data: pointer to byte array
+ *          length: number of bytes in array
+ * Output   1 length too long for buffer
+ *          2 not slave transmitter
+ *          0 ok
+ */
+uint8_t twi_transmit(const uint8_t *data, uint8_t length)
+{
+  uint8_t i;
+
+  // ensure data will fit into buffer
+  if (TWI_BUFFER_LENGTH < (twi_tx_buffer_length + length))
+  {
+    return 1;
+  }
+
+  // ensure we are currently a slave transmitter
+  if (TWI_STX != twi_state)
+  {
+    return 2;
+  }
+
+  // set length and copy data into tx buffer
+  for (i = 0; i < length; ++i)
+  {
+    twi_txBuffer[twi_tx_buffer_length + i] = data[i];
+  }
+  twi_tx_buffer_length += length;
+
+  return 0;
+}
+
+/* 
+ * Function twi_attach_slave_rx_event
+ * Desc     sets function called before a slave read operation
+ * Input    function: callback function to use
+ * Output   none
+ */
+void twi_attach_slave_rx_event(void (*function)(uint8_t *, int))
+{
+  twi_on_slave_receive = function;
+}
+
+/* 
+ * Function twi_attach_slave_tx_event
+ * Desc     sets function called before a slave write operation
+ * Input    function: callback function to use
+ * Output   none
+ */
+void twi_attach_slave_tx_event(void (*function)(void))
+{
+  twi_on_slave_transmit = function;
+}
+
+/* 
+ * Function twi_reply
+ * Desc     sends byte or readys receive line
+ * Input    ack: byte indicating to ack or to nack
+ * Output   none
+ */
 void twi_reply(uint8_t ack)
 {
-    // transmit master read ready signal, with or without ack
-    if (ack) {
-        TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT) | _BV(TWEA);
-    }
-    else {
-        TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT);
-    }
+  // transmit master read ready signal, with or without ack
+  if (ack)
+  {
+    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT) | _BV(TWEA);
+  }
+  else
+  {
+    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWINT);
+  }
 }
 
+/* 
+ * Function twi_stop
+ * Desc     relinquishes bus master status
+ * Input    none
+ * Output   none
+ */
 void twi_stop(void)
 {
-    // send stop condition
-    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTO);
-    // wait for stop condition to be exectued on bus
-    // TWINT is not set after a stop condition!
-    while (TWCR & _BV(TWSTO))
+  // send stop condition
+  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTO);
+
+  // wait for stop condition to be exectued on bus
+  // TWINT is not set after a stop condition!
+  // We cannot use micros() from an ISR, so approximate the timeout with cycle-counted delays
+  const uint8_t us_per_loop = 8;
+  uint32_t counter = (twi_timeout_us + us_per_loop - 1) / us_per_loop; // Round up
+  while (TWCR & _BV(TWSTO))
+  {
+    if (twi_timeout_us > 0ul)
     {
-        continue;
+      if (counter > 0ul)
+      {
+        _delay_us(us_per_loop);
+        counter--;
+      }
+      else
+      {
+        twi_handle_timeout(twi_do_reset_on_timeout);
+        return;
+      }
     }
-    // update twi state
-    twi_state = TWI_READY;
+  }
+
+  // update twi state
+  twi_state = TWI_READY;
 }
 
+/* 
+ * Function twi_release_bus
+ * Desc     releases bus control
+ * Input    none
+ * Output   none
+ */
 void twi_release_bus(void)
 {
-    // release bus
-    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT);
-    // update twi state
-    twi_state = TWI_READY;
+  // release bus
+  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT);
+
+  // update twi state
+  twi_state = TWI_READY;
+}
+
+/* 
+ * Function twi_set_timeout_in_micros
+ * Desc     set a timeout for while loops that twi might get stuck in
+ * Input    timeout value in microseconds (0 means never time out)
+ * Input    reset_with_timeout: 1 causes timeout events to reset twi
+ * Output   none
+ */
+void twi_set_timeout_in_micros(uint32_t timeout, uint8_t reset_with_timeout)
+{
+  twi_timed_out_flag = 0;
+  twi_timeout_us = timeout;
+  twi_do_reset_on_timeout = reset_with_timeout;
+}
+
+/* 
+ * Function twi_handle_timeout
+ * Desc     this gets called whenever a while loop here has lasted longer than
+ *          twi_timeout_us microseconds. always sets twi_timed_out_flag
+ * Input    reset: 1 causes this function to reset the twi hardware interface
+ * Output   none
+ */
+void twi_handle_timeout(uint8_t reset)
+{
+  twi_timed_out_flag = 1;
+
+  if (reset)
+  {
+    // remember bitrate and address settings
+    uint8_t previous_TWBR = TWBR;
+    uint8_t previous_TWAR = TWAR;
+
+    // reset the interface
+    twi_disable();
+    twi_init();
+
+    // reapply the previous register values
+    TWAR = previous_TWAR;
+    TWBR = previous_TWBR;
+  }
+}
+
+/*
+ * Function twi_manage_timeout_flag
+ * Desc     returns 1 if twi has seen a timeout
+ *          optionally clears the timeout flag
+ * Input    clear_flag: 1 if we should reset the hardware
+ * Output   the value of twi_timed_out_flag when the function was called
+ */
+uint8_t twi_manage_timeout_flag(uint8_t clear_flag)
+{
+  uint8_t flag = twi_timed_out_flag;
+  if (clear_flag)
+  {
+    twi_timed_out_flag = 0;
+  }
+  return (flag);
 }
 
 ISR(TWI_vect)
 {
-    switch (TW_STATUS)
+  switch (TW_STATUS)
+  {
+  // All Master
+  case TW_START:     // sent start condition
+  case TW_REP_START: // sent repeated start condition
+    // copy device address and r/w bit to output register and ack
+    TWDR = twi_slarw;
+    twi_reply(1);
+    break;
+
+  // Master Transmitter
+  case TW_MT_SLA_ACK:  // slave receiver acked address
+  case TW_MT_DATA_ACK: // slave receiver acked data
+    // if there is data to send, send it, otherwise stop
+    if (twi_master_buffer_index < twi_master_buffer_length)
     {
-    // All Master
-    case TW_START:     // sent start condition
-    case TW_REP_START: // sent repeated start condition
-        TWDR = twi_slarw;
-        twi_reply(TRUE);
-        break;
-
-    // Master Transmitter
-    case TW_MT_SLA_ACK:  // slave receiver acked address
-    case TW_MT_DATA_ACK: // slave receiver acked data
-        // if there is data to send, send it, otherwise stop
-        if (twi_master_buffer_index < twi_master_buffer_length)
-        {
-            // copy data to output register and ack
-            TWDR = twi_master_buffer[twi_master_buffer_index++];
-            twi_reply(TRUE);
-        }
-        else
-        {
-            if (twi_send_stop)
-            {
-                twi_stop();
-            }
-            else
-            {
-                twi_in_rep_start = TRUE; // we're gonna send the START
-                // don't enable the interrupt. We'll generate the start, but we
-                // avoid handling the interrupt until we're in the next transaction,
-                // at the point where we would normally issue the start.
-                TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);
-                twi_state = TWI_READY;
-            }
-        }
-        break;
-    case TW_MT_SLA_NACK: // address sent, nack received
-        twi_error = TW_MT_SLA_NACK;
-        twi_stop();
-        break;
-    case TW_MT_DATA_NACK: // data sent, nack received
-        twi_error = TW_MT_DATA_NACK;
-        twi_stop();
-        break;
-    case TW_MT_ARB_LOST: // lost bus arbitration
-        twi_error = TW_MT_ARB_LOST;
-        twi_release_bus();
-        break;
-
-    // Master Receiver
-    case TW_MR_DATA_ACK: // data received, ack sent
-        // put byte into buffer
-        twi_master_buffer[twi_master_buffer_index++] = TWDR;
-        // fall through
-    case TW_MR_SLA_ACK: // address sent, ack received
-        // ack if more bytes are expected, otherwise nack
-        if (twi_master_buffer_index < twi_master_buffer_length)
-        {
-            twi_reply(TRUE);
-        }
-        else
-        {
-            twi_reply(FALSE);
-        }
-        break;
-    case TW_MR_DATA_NACK: // data received, nack sent
-        // put final byte into buffer
-        twi_master_buffer[twi_master_buffer_index++] = TWDR;
-        if (twi_send_stop)
-        {
-            twi_stop();
-        }
-        else
-        {
-            twi_in_rep_start = TRUE; // we're gonna send the START
-            // don't enable the interrupt. We'll generate the start, but we
-            // avoid handling the interrupt until we're in the next transaction,
-            // at the point where we would normally issue the start.
-            TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);
-            twi_state = TWI_READY;
-        }
-        break;
-    case TW_MR_SLA_NACK: // address sent, nack received
-        twi_stop();
-        break;
-    // TW_MR_ARB_LOST handled by TW_MT_ARB_LOST case
-
-    // Slave Receiver
-    case TW_SR_SLA_ACK:            // addressed, returned ack
-    case TW_SR_GCALL_ACK:          // addressed generally, returned ack
-    case TW_SR_ARB_LOST_SLA_ACK:   // lost arbitration, returned ack
-    case TW_SR_ARB_LOST_GCALL_ACK: // lost arbitration, returned ack
-    case TW_SR_DATA_ACK:           // data received, returned ack
-    case TW_SR_GCALL_DATA_ACK:     // data received generally, returned ack
-    case TW_SR_STOP:               // stop or repeated start condition received
-    case TW_SR_DATA_NACK:          // data received, returned nack
-    case TW_SR_GCALL_DATA_NACK:    // data received generally, returned nack
-
-    // Slave Transmitter
-    case TW_ST_SLA_ACK:          // addressed, returned ack
-    case TW_ST_ARB_LOST_SLA_ACK: // arbitration lost, returned ack
-    case TW_ST_DATA_ACK:         // byte sent, ack returned
-    case TW_ST_DATA_NACK:        // received nack, we are done
-    case TW_ST_LAST_DATA:        // received ack, but we are done already!
-
-    // All
-    case TW_NO_INFO: // no state information
-        break;
-    case TW_BUS_ERROR: // bus error, illegal stop/start
-        twi_error = TW_BUS_ERROR;
-        twi_stop();
-        break;
+      // copy data to output register and ack
+      TWDR = twi_master_buffer[twi_master_buffer_index++];
+      twi_reply(1);
     }
+    else
+    {
+      if (twi_send_stop)
+      {
+        twi_stop();
+      }
+      else
+      {
+        twi_in_rep_start = 1; // we're gonna send the START
+        // don't enable the interrupt. We'll generate the start, but we
+        // avoid handling the interrupt until we're in the next transaction,
+        // at the point where we would normally issue the start.
+        TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);
+        twi_state = TWI_READY;
+      }
+    }
+    break;
+  case TW_MT_SLA_NACK: // address sent, nack received
+    twi_error = TW_MT_SLA_NACK;
+    twi_stop();
+    break;
+  case TW_MT_DATA_NACK: // data sent, nack received
+    twi_error = TW_MT_DATA_NACK;
+    twi_stop();
+    break;
+  case TW_MT_ARB_LOST: // lost bus arbitration
+    twi_error = TW_MT_ARB_LOST;
+    twi_release_bus();
+    break;
+
+  // Master Receiver
+  case TW_MR_DATA_ACK: // data received, ack sent
+    // put byte into buffer
+    twi_master_buffer[twi_master_buffer_index++] = TWDR;
+    // __attribute__((fallthrough));
+  case TW_MR_SLA_ACK: // address sent, ack received
+    // ack if more bytes are expected, otherwise nack
+    if (twi_master_buffer_index < twi_master_buffer_length)
+    {
+      twi_reply(1);
+    }
+    else
+    {
+      twi_reply(0);
+    }
+    break;
+  case TW_MR_DATA_NACK: // data received, nack sent
+    // put final byte into buffer
+    twi_master_buffer[twi_master_buffer_index++] = TWDR;
+    if (twi_send_stop)
+    {
+      twi_stop();
+    }
+    else
+    {
+      twi_in_rep_start = 1; // we're gonna send the START
+      // don't enable the interrupt. We'll generate the start, but we
+      // avoid handling the interrupt until we're in the next transaction,
+      // at the point where we would normally issue the start.
+      TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);
+      twi_state = TWI_READY;
+    }
+    break;
+  case TW_MR_SLA_NACK: // address sent, nack received
+    twi_stop();
+    break;
+  // TW_MR_ARB_LOST handled by TW_MT_ARB_LOST case
+
+  // Slave Receiver
+  case TW_SR_SLA_ACK:            // addressed, returned ack
+  case TW_SR_GCALL_ACK:          // addressed generally, returned ack
+  case TW_SR_ARB_LOST_SLA_ACK:   // lost arbitration, returned ack
+  case TW_SR_ARB_LOST_GCALL_ACK: // lost arbitration, returned ack
+    // enter slave receiver mode
+    twi_state = TWI_SRX;
+    // indicate that rx buffer can be overwritten and ack
+    twi_rx_buffer_index = 0;
+    twi_reply(1);
+    break;
+  case TW_SR_DATA_ACK:       // data received, returned ack
+  case TW_SR_GCALL_DATA_ACK: // data received generally, returned ack
+    // if there is still room in the rx buffer
+    if (twi_rx_buffer_index < TWI_BUFFER_LENGTH)
+    {
+      // put byte in buffer and ack
+      twi_rx_buffer[twi_rx_buffer_index++] = TWDR;
+      twi_reply(1);
+    }
+    else
+    {
+      // otherwise nack
+      twi_reply(0);
+    }
+    break;
+  case TW_SR_STOP: // stop or repeated start condition received
+    // ack future responses and leave slave receiver state
+    twi_release_bus();
+    // put a null char after data if there's room
+    if (twi_rx_buffer_index < TWI_BUFFER_LENGTH)
+    {
+      twi_rx_buffer[twi_rx_buffer_index] = '\0';
+    }
+    // callback to user defined callback
+    twi_on_slave_receive(twi_rx_buffer, twi_rx_buffer_index);
+    // since we submit rx buffer to "wire" library, we can reset it
+    twi_rx_buffer_index = 0;
+    break;
+  case TW_SR_DATA_NACK:       // data received, returned nack
+  case TW_SR_GCALL_DATA_NACK: // data received generally, returned nack
+    // nack back at master
+    twi_reply(0);
+    break;
+
+  // Slave Transmitter
+  case TW_ST_SLA_ACK:          // addressed, returned ack
+  case TW_ST_ARB_LOST_SLA_ACK: // arbitration lost, returned ack
+    // enter slave transmitter mode
+    twi_state = TWI_STX;
+    // ready the tx buffer index for iteration
+    twi_tx_buffer_index = 0;
+    // set tx buffer length to be zero, to verify if user changes it
+    twi_tx_buffer_length = 0;
+    // request for txBuffer to be filled and length to be set
+    // note: user must call twi_transmit(bytes, length) to do this
+    twi_on_slave_transmit();
+    // if they didn't change buffer & length, initialize it
+    if (0 == twi_tx_buffer_length)
+    {
+      twi_tx_buffer_length = 1;
+      twi_txBuffer[0] = 0x00;
+    }
+    // __attribute__((fallthrough));
+    // transmit first byte from buffer, fall
+  case TW_ST_DATA_ACK: // byte sent, ack returned
+    // copy data to output register
+    TWDR = twi_txBuffer[twi_tx_buffer_index++];
+    // if there is more to send, ack, otherwise nack
+    if (twi_tx_buffer_index < twi_tx_buffer_length)
+    {
+      twi_reply(1);
+    }
+    else
+    {
+      twi_reply(0);
+    }
+    break;
+  case TW_ST_DATA_NACK: // received nack, we are done
+  case TW_ST_LAST_DATA: // received ack, but we are done already!
+    // ack future responses
+    twi_reply(1);
+    // leave slave receiver state
+    twi_state = TWI_READY;
+    break;
+
+  // All
+  case TW_NO_INFO: // no state information
+    break;
+  case TW_BUS_ERROR: // bus error, illegal stop/start
+    twi_error = TW_BUS_ERROR;
+    twi_stop();
+    break;
+  }
 }

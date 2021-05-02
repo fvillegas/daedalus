@@ -1,16 +1,15 @@
 /*
  * timer.h
- *
- * Created: 7/13/2020 10:50:16 PM
- *  Author: fcvil
  */ 
 
 
 #ifndef TIMER_H_
 #define TIMER_H_
 
-void init_millis(unsigned long f_cpu);
-unsigned long millis();
-
+void timer_init(void);
+void delay_microseconds(unsigned int us);
+void delay(unsigned long ms);
+unsigned long micros(void);
+unsigned long millis(void);
 
 #endif /* TIMER_H_ */
