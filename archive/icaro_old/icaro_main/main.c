@@ -2,7 +2,7 @@
 #include <avr/interrupt.h>
 
 #include "icaro/timer/timer.h"
-// #include "icaro/twi/twi.h"
+#include "icaro/twi/twi.h"
 // #include "icaro/twi/i2cdevlib.h"
 // #include "icaro/imu.h"
 
