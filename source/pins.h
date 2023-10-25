@@ -29,6 +29,10 @@
 void pins_init(void) {
   DDRB |= (1 << PB1);
   DDRB |= (1 << PB2);
+  DDRB |= (1 << PB3);
+  DDRD |= (1 << PD3);
+  DDRD |= (1 << PD5);
+  DDRD |= (1 << PD6);
 }
 
 #endif
